@@ -283,7 +283,6 @@ verify_database_revision() {
 }
 
 central_company_ids_from_response() {
-  local response="${1:-/dev/stdin}"
   jq -er '
     if (
       (.grants | type == "array" and length > 0)
@@ -293,7 +292,7 @@ central_company_ids_from_response() {
         and (.jws | type == "string" and length > 0)
       )
     ) then .grants[].company_id else error("invalid central grant response") end' \
-    "$response" | sort -u
+    | sort -u
 }
 
 probe_central() {

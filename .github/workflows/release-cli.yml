@@ -15,6 +15,14 @@ jobs:
       - name: Check out deployment repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
+      - name: Pin ShellCheck version
+        run: |
+          set -Eeuo pipefail
+          scratch="$(mktemp -d)"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz" | tar -xJ -C "$scratch"
+          sudo install -m 0755 "$scratch/shellcheck-v0.11.0/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version | head -2
+
       - name: Validate version and scripts
         env:
           RELEASE_TAG: ${{ github.ref_name }}

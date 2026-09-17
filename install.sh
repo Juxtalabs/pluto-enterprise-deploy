@@ -26,7 +26,9 @@ verify_asset() {
   asset="$1"
   expected="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset {print $1; exit}' "$temporary/SHA256SUMS")"
   actual="$(sha256sum "$temporary/$asset" | awk '{print $1}')"
-  [ -n "$expected" ] && [ "$actual" = "$expected" ] || fail "Checksum verification failed for $asset"
+  if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+    fail "Checksum verification failed for $asset"
+  fi
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run this installer with sudo."

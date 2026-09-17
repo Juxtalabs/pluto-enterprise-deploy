@@ -81,7 +81,7 @@ EOF
 expected_companies="$(printf '%s\n' \
   aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa \
   bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb)"
-[[ "$(central_company_ids_from_response "$temporary/central-response.json")" == "$expected_companies" ]]
+[[ "$(central_company_ids_from_response <"$temporary/central-response.json")" == "$expected_companies" ]]
 
 cat >"$temporary/central.env" <<'EOF'
 SEJATI_ADMIN_URL=https://sejati-admin.juxtalabs.io
@@ -99,7 +99,7 @@ EOF
 )
 
 printf '{"grants":[]}\n' >"$temporary/empty-central-response.json"
-if central_company_ids_from_response "$temporary/empty-central-response.json"; then
+if central_company_ids_from_response <"$temporary/empty-central-response.json"; then
   printf 'An empty central grant response was accepted.\n' >&2
   exit 1
 fi
