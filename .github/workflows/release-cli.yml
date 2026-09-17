@@ -1,0 +1,60 @@
+name: Release Pluto deployment CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out deployment repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Validate version and scripts
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          expected="${RELEASE_TAG#v}"
+          cli_version="$(sed -n 's/^PLUTO_CLI_VERSION="\([^"]*\)"$/\1/p' pluto | head -n 1)"
+          installer_version="$(sed -n 's/^PLUTO_CLI_VERSION="\([^"]*\)"$/\1/p' install.sh | head -n 1)"
+          test "$cli_version" = "$expected"
+          test "$installer_version" = "$expected"
+          bash -n pluto
+          sh -n install.sh
+          shellcheck -x pluto install.sh tests/test-pluto.sh
+          tests/test-pluto.sh
+
+      - name: Validate Compose definition
+        run: |
+          set -Eeuo pipefail
+          cp .env.example .env.release-check
+          docker compose --env-file .env.release-check -f compose.yaml config --quiet
+
+      - name: Create checksums
+        run: |
+          set -Eeuo pipefail
+          sha256sum pluto compose.yaml release.schema.json > SHA256SUMS
+          sha256sum install.sh > install.sh.sha256
+
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "Pluto deployment CLI $RELEASE_TAG" \
+            --generate-notes \
+            pluto \
+            install.sh \
+            install.sh.sha256 \
+            compose.yaml \
+            release.schema.json \
+            SHA256SUMS

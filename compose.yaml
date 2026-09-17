@@ -1,0 +1,100 @@
+name: ${COMPOSE_PROJECT_NAME:-pluto}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pluto
+      POSTGRES_USER: pluto
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pluto -d pluto"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - pluto
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - pluto
+
+  api:
+    image: ${PLUTO_API_IMAGE:?PLUTO_API_IMAGE is required}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://pluto:${POSTGRES_PASSWORD}@postgres:5432/pluto
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      DEBUG: "false"
+      ENV: production
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:?PUBLIC_APP_URL is required}
+      PASSWORD_ENC_KEY: ${PASSWORD_ENC_KEY:?PASSWORD_ENC_KEY is required}
+      FACE_BINDING_KEY: ${FACE_BINDING_KEY:?FACE_BINDING_KEY is required}
+      DEMO_SERVICE_TOKEN: ${DEMO_SERVICE_TOKEN:-}
+      FACE_DEMO_SERVICE_URL: ${FACE_DEMO_SERVICE_URL:-http://127.0.0.1:9098}
+      PLATFORM_LOGIN_CODE: ${PLATFORM_LOGIN_CODE:-}
+      SEJATI_GRANT_SIGNING_KEY: ${SEJATI_GRANT_SIGNING_KEY:-}
+      SEJATI_GRANT_SIGNING_KID: ${SEJATI_GRANT_SIGNING_KID:-}
+      GRANT_PUBLIC_KEYS_PATH: ${GRANT_PUBLIC_KEYS_PATH:-}
+      SEJATI_ADMIN_URL: ${SEJATI_ADMIN_URL:?SEJATI_ADMIN_URL is required}
+      SEJATI_ADMIN_SYNC_KEY: ${SEJATI_ADMIN_SYNC_KEY:?SEJATI_ADMIN_SYNC_KEY is required}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-10.88.0.0/24}
+      MIN_CLIENT_VERSION: ${MIN_CLIENT_VERSION:?MIN_CLIENT_VERSION is required}
+      API_PROFILE: ${API_PROFILE:?API_PROFILE is required}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks:
+      - pluto
+
+  web:
+    image: ${PLUTO_WEB_IMAGE:?PLUTO_WEB_IMAGE is required}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - ${PLUTO_WEB_BIND:-127.0.0.1:18080}:80
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - pluto
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-pluto}-postgres-data
+  redis_data:
+    name: ${COMPOSE_PROJECT_NAME:-pluto}-redis-data
+
+networks:
+  pluto:
+    name: ${COMPOSE_PROJECT_NAME:-pluto}-net
+    ipam:
+      config:
+        - subnet: ${PLUTO_NETWORK_SUBNET:-10.88.0.0/24}

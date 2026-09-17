@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+PLUTO_CLI_VERSION="1.0.0"
+PLUTO_ROOT="${PLUTO_ROOT:-/opt/pluto}"
+PLUTO_REPOSITORY="Juxtalabs/pluto-enterprise-deploy"
+COMPOSE_FILE="$PLUTO_ROOT/compose.yaml"
+ENV_FILE="$PLUTO_ROOT/.env"
+STATE_DIR="$PLUTO_ROOT/state"
+RELEASES_DIR="$PLUTO_ROOT/releases"
+BACKUPS_DIR="$PLUTO_ROOT/backups"
+LOGS_DIR="$PLUTO_ROOT/logs"
+LOCK_FILE="$PLUTO_ROOT/pluto.lock"
+CENTRAL_ORIGIN="https://sejati-admin.juxtalabs.io"
+
+info() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Pluto Enterprise deployment CLI
+
+Usage:
+  pluto install <app-vX.Y.Z>
+  pluto update <app-vX.Y.Z>
+  pluto status
+  pluto doctor
+  pluto backup [destination]
+  pluto configure central
+  pluto registry-check
+  pluto self-update <vX.Y.Z>
+  pluto version
+EOF
+}
+
+require_root() {
+  [[ "$EUID" -eq 0 ]] || fail "Run this command with sudo."
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command is missing: $1"
+}
+
+require_runtime() {
+  local command
+  for command in docker curl jq openssl gzip sha256sum flock awk sed grep sort df stat mktemp install head tr; do
+    require_command "$command"
+  done
+  docker info >/dev/null 2>&1 || fail "Docker Engine is not running or is not accessible."
+  docker compose version >/dev/null 2>&1 || fail "The Docker Compose plugin is not available."
+}
+
+require_disk_headroom() {
+  local available_kib
+  available_kib="$(df -Pk "$PLUTO_ROOT" | awk 'NR == 2 {print $4}')"
+  [[ "$available_kib" =~ ^[0-9]+$ ]] || fail "Could not determine free disk space for $PLUTO_ROOT."
+  ((available_kib >= 5242880)) || fail "At least 5 GiB of free disk space is required before install or update."
+}
+
+require_layout() {
+  [[ -f "$COMPOSE_FILE" ]] || fail "Deployment files are missing. Run the pinned Pluto bootstrap installer again."
+  mkdir -p "$STATE_DIR" "$RELEASES_DIR" "$BACKUPS_DIR" "$LOGS_DIR"
+  chmod 0750 "$PLUTO_ROOT" "$STATE_DIR" "$RELEASES_DIR" "$LOGS_DIR"
+  chmod 0700 "$BACKUPS_DIR"
+}
+
+lock_mutation() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || fail "Another Pluto operation is already running."
+}
+
+validate_app_release() {
+  [[ "$1" =~ ^app-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Application release must look like app-v0.9.25."
+}
+
+validate_cli_release() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "CLI release must look like v1.0.0."
+}
+
+version_is_older() {
+  local current="$1"
+  local required="$2"
+  [[ "$current" != "$required" ]] && [[ "$(printf '%s\n%s\n' "$current" "$required" | sort -V | head -n 1)" == "$current" ]]
+}
+
+env_value() {
+  local key="$1"
+  local file="${2:-$ENV_FILE}"
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+
+state_value() {
+  local name="$1"
+  local file="$STATE_DIR/$name"
+  if [[ -f "$file" ]]; then
+    sed -n '1p' "$file"
+  fi
+  return 0
+}
+
+write_state_value() {
+  local name="$1"
+  local value="$2"
+  local temporary
+  temporary="$(mktemp "$STATE_DIR/.${name}.XXXXXX")"
+  chmod 0600 "$temporary"
+  printf '%s\n' "$value" >"$temporary"
+  mv "$temporary" "$STATE_DIR/$name"
+}
+
+compose_with() {
+  local env_file="$1"
+  shift
+  docker compose --project-directory "$PLUTO_ROOT" --env-file "$env_file" -f "$COMPOSE_FILE" "$@"
+}
+
+release_url() {
+  printf 'https://github.com/%s/releases/download/%s/%s' "$PLUTO_REPOSITORY" "$1" "$2"
+}
+
+validate_manifest_file() {
+  local release="$1"
+  local manifest="$2"
+  local minimum
+  jq -e \
+    --arg release "$release" \
+    '.schema_version == 1
+      and .release == $release
+      and (.source_commit | test("^[0-9a-f]{40}$"))
+      and (.api_image | test("^ghcr\\.io/juxtalabs/pluto-enterprise-api@sha256:[0-9a-f]{64}$"))
+      and (.web_image | test("^ghcr\\.io/juxtalabs/pluto-enterprise-web@sha256:[0-9a-f]{64}$"))
+      and (.alembic_head | type == "string" and length > 0)
+      and (.minimum_pluto_cli | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+      and (.created_at | type == "string" and length > 0)
+      and ((keys | sort) == (["alembic_head", "api_image", "created_at", "minimum_pluto_cli", "release", "schema_version", "source_commit", "web_image"] | sort))' \
+    "$manifest" >/dev/null || fail "The release manifest is not valid."
+  minimum="$(jq -r '.minimum_pluto_cli' "$manifest")"
+  version_is_older "$PLUTO_CLI_VERSION" "$minimum" && fail "Release $release requires Pluto CLI $minimum or newer. Run pluto self-update first."
+  return 0
+}
+
+download_manifest() {
+  local release="$1"
+  local temporary manifest checksum expected actual
+  temporary="$(mktemp -d "$PLUTO_ROOT/.manifest.XXXXXX")"
+  manifest="$temporary/$release.json"
+  checksum="$temporary/$release.sha256"
+  curl --proto '=https' --tlsv1.2 -fsSL "$(release_url "$release" "$release.json")" -o "$manifest" || {
+    rm -r "$temporary"
+    fail "Release $release was not found or could not be downloaded."
+  }
+  curl --proto '=https' --tlsv1.2 -fsSL "$(release_url "$release" "$release.sha256")" -o "$checksum" || {
+    rm -r "$temporary"
+    fail "The checksum for $release could not be downloaded."
+  }
+  expected="$(awk 'NR == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$checksum")"
+  actual="$(sha256sum "$manifest" | awk '{print $1}')"
+  [[ -n "$expected" && "$actual" == "$expected" ]] || {
+    rm -r "$temporary"
+    fail "The release manifest checksum did not match."
+  }
+  if ! (validate_manifest_file "$release" "$manifest"); then
+    rm -r "$temporary"
+    fail "The release manifest failed validation."
+  fi
+  install -m 0644 "$manifest" "$RELEASES_DIR/$release.json"
+  rm -r "$temporary"
+}
+
+manifest_value() {
+  jq -r ".$2" "$RELEASES_DIR/$1.json"
+}
+
+replace_env_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local temporary
+  grep -q "^${key}=" "$file" || fail "Required setting $key is missing from $file."
+  temporary="$(mktemp "$PLUTO_ROOT/.env.XXXXXX")"
+  chmod 0600 "$temporary"
+  awk -v key="$key" -v value="$value" 'BEGIN {FS=OFS="="} $1 == key {$0=key OFS value} {print}' "$file" >"$temporary"
+  mv "$temporary" "$file"
+}
+
+stage_release_env() {
+  local release="$1"
+  local source_file="$2"
+  local target="$RELEASES_DIR/$release.env"
+  install -m 0600 "$source_file" "$target"
+  replace_env_value "$target" PLUTO_API_IMAGE "$(manifest_value "$release" api_image)"
+  replace_env_value "$target" PLUTO_WEB_IMAGE "$(manifest_value "$release" web_image)"
+  printf '%s' "$target"
+}
+
+read_central_key() {
+  local key
+  read -r -s -p "Central standalone sync key (input hidden): " key
+  printf '\n'
+  [[ "$key" =~ ^[A-Za-z0-9_-]{20,}$ ]] || fail "The central sync key has an invalid format. Paste only the key value Pluto supplied."
+  CENTRAL_KEY_VALUE="$key"
+}
+
+prompt_first_install() {
+  local origin username token api_image web_image
+  read -r -p "Enterprise dashboard origin (https://... with no trailing slash): " origin
+  [[ "$origin" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || fail "Enter an HTTPS origin with no path or trailing slash."
+  read_central_key
+  read -r -p "Approved GHCR username: " username
+  [[ "$username" =~ ^[A-Za-z0-9-]+$ ]] || fail "GHCR username has an invalid format."
+  read -r -s -p "GHCR read:packages token: " token
+  printf '\n'
+  [[ -n "$token" ]] || fail "The GHCR token cannot be empty."
+  printf '%s' "$token" | docker login ghcr.io --username "$username" --password-stdin >/dev/null || fail "GHCR login failed. Confirm the username, token, and package access with Pluto."
+  unset token
+  api_image="$(manifest_value "$INSTALL_RELEASE" api_image)"
+  web_image="$(manifest_value "$INSTALL_RELEASE" web_image)"
+  umask 077
+  local temporary
+  temporary="$(mktemp "$PLUTO_ROOT/.env.XXXXXX")"
+  cat >"$temporary" <<EOF
+COMPOSE_PROJECT_NAME=pluto
+PLUTO_API_IMAGE=$api_image
+PLUTO_WEB_IMAGE=$web_image
+PLUTO_PUBLIC_ORIGIN=$origin
+PLUTO_NETWORK_SUBNET=10.88.0.0/24
+PLUTO_WEB_BIND=127.0.0.1:18080
+POSTGRES_PASSWORD=$(openssl rand -hex 32)
+JWT_SECRET=$(openssl rand -hex 32)
+PASSWORD_ENC_KEY=$(openssl rand -hex 32)
+FACE_BINDING_KEY=$(openssl rand -hex 32)
+DEBUG=false
+ENV=production
+API_PROFILE=operational
+PUBLIC_APP_URL=$origin
+CORS_ORIGINS=$origin
+TRUSTED_PROXY_IPS=10.88.0.0/24
+MIN_CLIENT_VERSION=0.0.0
+SEJATI_ADMIN_URL=$CENTRAL_ORIGIN
+SEJATI_ADMIN_SYNC_KEY=$CENTRAL_KEY_VALUE
+PLATFORM_LOGIN_CODE=
+DEMO_SERVICE_TOKEN=
+FACE_DEMO_SERVICE_URL=http://127.0.0.1:9098
+SEJATI_GRANT_SIGNING_KEY=
+SEJATI_GRANT_SIGNING_KID=
+GRANT_PUBLIC_KEYS_PATH=
+EOF
+  chmod 0600 "$temporary"
+  chown root:root "$temporary"
+  mv "$temporary" "$ENV_FILE"
+  unset CENTRAL_KEY_VALUE
+}
+
+preflight_new_install() {
+  local identifier subnet
+  docker compose ls --format json | jq -e '.[] | select(.Name == "pluto")' >/dev/null 2>&1 && fail "A Docker Compose project named pluto already exists."
+  docker volume inspect pluto-postgres-data >/dev/null 2>&1 && fail "Docker volume pluto-postgres-data already exists. Pluto will not adopt it."
+  docker volume inspect pluto-redis-data >/dev/null 2>&1 && fail "Docker volume pluto-redis-data already exists. Pluto will not adopt it."
+  docker network inspect pluto-net >/dev/null 2>&1 && fail "Docker network pluto-net already exists. Pluto will not adopt it."
+  if command -v ss >/dev/null 2>&1 && ss -ltnH | awk '{print $4}' | grep -Eq '(^|:|\])18080$'; then
+    fail "TCP port 18080 is already in use."
+  fi
+  while IFS= read -r identifier; do
+    while IFS= read -r subnet; do
+      [[ "$subnet" == "10.88.0.0/24" ]] && fail "Docker subnet 10.88.0.0/24 is already in use."
+    done < <(docker network inspect --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' "$identifier")
+  done < <(docker network ls --quiet)
+}
+
+verify_database_revision() {
+  local env_file="$1"
+  local expected="$2"
+  local actual
+  actual="$(compose_with "$env_file" exec -T postgres psql -U pluto -d pluto -Atc 'SELECT version_num FROM alembic_version' | tr -d '[:space:]')"
+  [[ "$actual" == "$expected" ]] || fail "Database migration revision is $actual; expected $expected."
+}
+
+central_company_ids_from_response() {
+  local response="${1:-/dev/stdin}"
+  jq -er '
+    if (
+      (.grants | type == "array" and length > 0)
+      and all(.grants[];
+        (.company_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+        and (.installation_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+        and (.jws | type == "string" and length > 0)
+      )
+    ) then .grants[].company_id else error("invalid central grant response") end' \
+    "$response" | sort -u
+}
+
+probe_central() {
+  local env_file="$1"
+  local central key response company_ids
+  central="$(env_value SEJATI_ADMIN_URL "$env_file")"
+  key="$(env_value SEJATI_ADMIN_SYNC_KEY "$env_file")"
+  [[ "$central" == "$CENTRAL_ORIGIN" ]] || return 1
+  [[ "$key" =~ ^[A-Za-z0-9_-]{20,}$ ]] || return 1
+  if ! response="$(printf 'header = "Authorization: Bearer %s"\n' "$key" | curl \
+    --config - \
+    --proto '=https' \
+    --tlsv1.2 \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 20 \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --data '{"acknowledged":{}}' \
+    "$central/api/v1/sync/grants")"; then
+    return 1
+  fi
+  if ! company_ids="$(printf '%s' "$response" | central_company_ids_from_response)"; then
+    unset response
+    return 1
+  fi
+  unset response
+  printf '%s\n' "$company_ids"
+}
+
+local_grant_company_ids() {
+  local env_file="$1"
+  compose_with "$env_file" exec -T postgres psql -U pluto -d pluto -Atc \
+    "SELECT company_id::text FROM company_grants WHERE deleted_at IS NULL ORDER BY company_id::text" \
+    2>/dev/null | sed '/^$/d'
+}
+
+active_grant_company_ids() {
+  local env_file="$1"
+  compose_with "$env_file" exec -T postgres psql -U pluto -d pluto -Atc \
+    "SELECT company_id::text FROM company_grants WHERE deleted_at IS NULL AND company_status = 'active' ORDER BY company_id::text" \
+    2>/dev/null | sed '/^$/d'
+}
+
+grant_set_matches() {
+  local env_file="$1"
+  local expected="$2"
+  local actual
+  actual="$(active_grant_company_ids "$env_file" || true)"
+  [[ -n "$actual" && "$actual" == "$expected" ]]
+}
+
+verify_grant_set() {
+  local env_file="$1"
+  local expected="$2"
+  for _ in {1..12}; do
+    grant_set_matches "$env_file" "$expected" && return 0
+    sleep 5
+  done
+  return 1
+}
+
+verify_services() {
+  local env_file="$1"
+  local origin
+  origin="$(env_value PLUTO_PUBLIC_ORIGIN "$env_file")"
+  compose_with "$env_file" ps
+  curl -fsS --max-time 10 http://127.0.0.1:18080/ping -o /dev/null || return 1
+  if ! curl -fsS --max-time 15 "$origin/ping" -o /dev/null; then
+    info "Warning: $origin/ping is not reachable yet. Finish DNS and HTTPS proxy setup, then run pluto doctor."
+  fi
+}
+
+rollback_application() {
+  local previous_env="$1"
+  compose_with "$previous_env" up -d --wait api web && verify_services "$previous_env"
+}
+
+record_operation() {
+  local operation="$1"
+  local release="$2"
+  local result="$3"
+  local backup_path="${4:-}"
+  jq -n \
+    --arg operation "$operation" \
+    --arg release "$release" \
+    --arg result "$result" \
+    --arg backup "$backup_path" \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{operation: $operation, release: $release, result: $result, backup: $backup, timestamp: $timestamp}' \
+    >"$STATE_DIR/last-operation.json"
+  chmod 0600 "$STATE_DIR/last-operation.json"
+}
+
+install_release() {
+  require_root
+  require_runtime
+  require_layout
+  lock_mutation
+  INSTALL_RELEASE="${1:-}"
+  validate_app_release "$INSTALL_RELEASE"
+  [[ ! -f "$STATE_DIR/current-release" ]] || fail "Pluto is already installed. Use pluto update, not pluto install."
+  require_disk_headroom
+  download_manifest "$INSTALL_RELEASE"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    preflight_new_install
+    prompt_first_install
+  else
+    info "Resuming the incomplete installation using the existing $ENV_FILE."
+  fi
+  local staged expected expected_companies existing_companies
+  staged="$(stage_release_env "$INSTALL_RELEASE" "$ENV_FILE")"
+  expected_companies="$(probe_central "$staged")" || fail "Central rejected the sync key or returned no company grant. Confirm the standalone key with Pluto."
+  compose_with "$staged" pull api web
+  compose_with "$staged" up -d --wait postgres redis
+  existing_companies="$(local_grant_company_ids "$staged" || true)"
+  if [[ -n "$existing_companies" && "$existing_companies" != "$expected_companies" ]]; then
+    fail "The restored database belongs to a different central company set. Refusing to start the application."
+  fi
+  if ! compose_with "$staged" run --rm --no-deps api alembic upgrade head; then
+    record_operation install "$INSTALL_RELEASE" migration-failed
+    fail "Database migration failed. The database and generated configuration were left in place for diagnosis."
+  fi
+  expected="$(manifest_value "$INSTALL_RELEASE" alembic_head)"
+  verify_database_revision "$staged" "$expected"
+  compose_with "$staged" up -d --wait api web
+  if ! verify_services "$staged"; then
+    record_operation install "$INSTALL_RELEASE" health-check-failed
+    fail "The containers started, but the local dashboard health check failed. Run pluto doctor."
+  fi
+  if ! verify_grant_set "$staged" "$expected_companies"; then
+    record_operation install "$INSTALL_RELEASE" central-sync-incomplete
+    fail "The application is healthy, but the locally verified active grants do not match the companies assigned to this central key. Check central access with pluto doctor, then rerun the same install command."
+  fi
+  install -m 0600 "$staged" "$ENV_FILE"
+  write_state_value current-release "$INSTALL_RELEASE"
+  write_state_value current-alembic "$expected"
+  record_operation install "$INSTALL_RELEASE" succeeded
+  info "Pluto Enterprise $INSTALL_RELEASE is installed."
+  status_command
+}
+
+backup_command() {
+  require_root
+  require_runtime
+  require_layout
+  [[ -f "$ENV_FILE" && -f "$STATE_DIR/current-release" ]] || fail "Pluto is not installed."
+  local destination="${1:-$BACKUPS_DIR}"
+  local release revision stamp bundle temporary
+  [[ "$destination" == /* ]] || fail "Backup destination must be an absolute path."
+  [[ -d "$destination" ]] || fail "Backup destination does not exist: $destination"
+  [[ -w "$destination" ]] || fail "Backup destination is not writable: $destination"
+  release="$(state_value current-release)"
+  revision="$(state_value current-alembic)"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  bundle="$destination/pluto-$release-$stamp"
+  [[ ! -e "$bundle" ]] || fail "Backup destination already exists: $bundle"
+  temporary="$(mktemp -d "$destination/.pluto-backup.XXXXXX")"
+  chmod 0700 "$temporary"
+  if ! compose_with "$ENV_FILE" exec -T postgres pg_dump -U pluto -d pluto | gzip -9 >"$temporary/database.sql.gz"; then
+    rm -r "$temporary"
+    fail "Database backup failed."
+  fi
+  gzip -t "$temporary/database.sql.gz" || {
+    rm -r "$temporary"
+    fail "The compressed database backup failed validation."
+  }
+  gzip -cd "$temporary/database.sql.gz" | awk '/CREATE TABLE public.alembic_version/ { found = 1 } END { exit !found }' || {
+    rm -r "$temporary"
+    fail "The database backup does not contain the expected schema marker."
+  }
+  install -m 0600 "$ENV_FILE" "$temporary/.env"
+  jq -n \
+    --arg release "$release" \
+    --arg alembic "$revision" \
+    --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{release: $release, alembic_head: $alembic, created_at: $created_at}' >"$temporary/metadata.json"
+  chmod 0600 "$temporary/metadata.json"
+  (cd "$temporary" && sha256sum database.sql.gz .env metadata.json >SHA256SUMS)
+  chmod 0600 "$temporary/SHA256SUMS"
+  mv "$temporary" "$bundle"
+  BACKUP_RESULT="$bundle"
+  write_state_value last-backup "$bundle"
+  info "Verified backup created at $bundle"
+}
+
+update_release() {
+  require_root
+  require_runtime
+  require_layout
+  lock_mutation
+  local release="${1:-}" current current_version requested_version staged previous_env expected expected_companies existing_companies
+  validate_app_release "$release"
+  [[ -f "$ENV_FILE" && -f "$STATE_DIR/current-release" ]] || fail "Pluto is not installed."
+  require_disk_headroom
+  current="$(state_value current-release)"
+  current_version="${current#app-v}"
+  requested_version="${release#app-v}"
+  [[ "$current" != "$release" ]] || fail "$release is already installed."
+  version_is_older "$requested_version" "$current_version" && fail "Downgrades are not supported. Current release is $current."
+  download_manifest "$release"
+  staged="$(stage_release_env "$release" "$ENV_FILE")"
+  expected_companies="$(probe_central "$staged")" || fail "Central rejected the configured sync key or returned no company grant. Resolve central access before updating."
+  existing_companies="$(local_grant_company_ids "$ENV_FILE" || true)"
+  [[ -n "$existing_companies" && "$existing_companies" == "$expected_companies" ]] || fail "The local database company set does not match the companies assigned to the configured central key."
+  compose_with "$staged" pull api web
+  backup_command "$BACKUPS_DIR"
+  previous_env="$RELEASES_DIR/$current.env"
+  install -m 0600 "$ENV_FILE" "$previous_env"
+  if ! compose_with "$staged" run --rm --no-deps api alembic upgrade head; then
+    record_operation update "$release" migration-failed "$BACKUP_RESULT"
+    fail "Migration failed. The existing application remains selected. Backup: $BACKUP_RESULT"
+  fi
+  expected="$(manifest_value "$release" alembic_head)"
+  verify_database_revision "$staged" "$expected"
+  if ! compose_with "$staged" up -d --wait api web; then
+    info "The new containers failed health checks. Restoring the previous application images."
+    if rollback_application "$previous_env"; then
+      record_operation update "$release" application-rollback-succeeded "$BACKUP_RESULT"
+      fail "The previous application images were restored and passed local health checks. The database migration was not reversed. Backup: $BACKUP_RESULT"
+    fi
+    record_operation update "$release" application-rollback-failed "$BACKUP_RESULT"
+    fail "The new application and the previous application images both failed health checks. The database migration was not reversed. Backup: $BACKUP_RESULT"
+  fi
+  if ! verify_services "$staged"; then
+    info "The new dashboard failed its local health check. Restoring the previous application images."
+    if rollback_application "$previous_env"; then
+      record_operation update "$release" application-rollback-succeeded "$BACKUP_RESULT"
+      fail "The previous application images were restored and passed local health checks. The database migration was not reversed. Backup: $BACKUP_RESULT"
+    fi
+    record_operation update "$release" application-rollback-failed "$BACKUP_RESULT"
+    fail "The new application and the previous application images both failed health checks. The database migration was not reversed. Backup: $BACKUP_RESULT"
+  fi
+  if ! verify_grant_set "$staged" "$expected_companies"; then
+    info "The locally verified active grants no longer match central. Restoring the previous application images."
+    if rollback_application "$previous_env"; then
+      record_operation update "$release" central-sync-rollback-succeeded "$BACKUP_RESULT"
+      fail "The previous application images were restored and passed local health checks. The database migration was not reversed. Backup: $BACKUP_RESULT"
+    fi
+    record_operation update "$release" central-sync-rollback-failed "$BACKUP_RESULT"
+    fail "The central grant check failed and the previous application images could not be restored to a healthy state. The database migration was not reversed. Backup: $BACKUP_RESULT"
+  fi
+  install -m 0600 "$staged" "$ENV_FILE"
+  write_state_value previous-release "$current"
+  write_state_value current-release "$release"
+  write_state_value current-alembic "$expected"
+  record_operation update "$release" succeeded "$BACKUP_RESULT"
+  info "Pluto Enterprise was updated from $current to $release."
+  status_command
+}
+
+status_command() {
+  require_runtime
+  [[ -f "$ENV_FILE" ]] || fail "Pluto is not configured at $PLUTO_ROOT."
+  local release central origin revision backup
+  release="$(state_value current-release)"
+  central="$(env_value SEJATI_ADMIN_URL)"
+  origin="$(env_value PLUTO_PUBLIC_ORIGIN)"
+  revision="$(state_value current-alembic)"
+  backup="$(state_value last-backup)"
+  info "Pluto Enterprise"
+  info "Release: ${release:-incomplete installation}"
+  info "Database revision: ${revision:-unknown}"
+  info "Dashboard: $origin"
+  info "Central: $central"
+  info "Environment: $ENV_FILE (root:root 0600)"
+  info "Last verified backup: ${backup:-none recorded}"
+  compose_with "$ENV_FILE" ps
+}
+
+doctor_command() {
+  local failures=0
+  info "Pluto Enterprise diagnostics"
+  for command in docker curl jq openssl gzip sha256sum flock awk sed grep sort df stat mktemp install head tr; do
+    if command -v "$command" >/dev/null 2>&1; then
+      info "OK  command: $command"
+    else
+      info "FAIL command: $command"
+      failures=$((failures + 1))
+    fi
+  done
+  if docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    info "OK  Docker Engine and Compose"
+  else
+    info "FAIL Docker Engine or Compose"
+    failures=$((failures + 1))
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    local mode owner origin central
+    mode="$(stat -c '%a' "$ENV_FILE")"
+    owner="$(stat -c '%U:%G' "$ENV_FILE")"
+    if [[ "$mode" == "600" && "$owner" == "root:root" ]]; then
+      info "OK  $ENV_FILE permissions"
+    else
+      info "FAIL $ENV_FILE must be root:root 0600; found $owner $mode"
+      failures=$((failures + 1))
+    fi
+    if compose_with "$ENV_FILE" config --quiet; then
+      info "OK  Compose configuration"
+    else
+      info "FAIL Compose configuration"
+      failures=$((failures + 1))
+    fi
+    if curl -fsS --max-time 10 http://127.0.0.1:18080/ping -o /dev/null; then
+      info "OK  local dashboard /ping"
+    else
+      info "FAIL local dashboard /ping"
+      failures=$((failures + 1))
+    fi
+    origin="$(env_value PLUTO_PUBLIC_ORIGIN)"
+    central="$(env_value SEJATI_ADMIN_URL)"
+    if curl -fsS --max-time 10 "$origin/ping" -o /dev/null; then
+      info "OK  public dashboard /ping"
+    else
+      info "FAIL public dashboard /ping"
+      failures=$((failures + 1))
+    fi
+    if curl -fsS --max-time 10 "$central/" -o /dev/null; then
+      info "OK  central HTTPS reachability"
+    else
+      info "FAIL central HTTPS reachability"
+      failures=$((failures + 1))
+    fi
+    compose_with "$ENV_FILE" ps
+  else
+    info "INFO $ENV_FILE does not exist; the application is not configured."
+  fi
+  df -h "$PLUTO_ROOT" 2>/dev/null || true
+  [[ "$failures" -eq 0 ]] || fail "$failures diagnostic check(s) failed."
+}
+
+registry_check() {
+  require_root
+  require_runtime
+  [[ -f "$ENV_FILE" ]] || fail "Pluto is not configured."
+  if compose_with "$ENV_FILE" pull api web; then
+    info "GHCR access is working for both private Pluto packages."
+  else
+    fail "GHCR access failed. Ask Pluto to confirm package access, renew the read:packages token, run docker login ghcr.io, and retry."
+  fi
+}
+
+configure_central() {
+  require_root
+  require_runtime
+  require_layout
+  lock_mutation
+  [[ -f "$ENV_FILE" ]] || fail "Pluto is not configured."
+  read_central_key
+  local staged expected_companies existing_companies
+  staged="$(mktemp "$PLUTO_ROOT/.env.XXXXXX")"
+  install -m 0600 "$ENV_FILE" "$staged"
+  replace_env_value "$staged" SEJATI_ADMIN_URL "$CENTRAL_ORIGIN"
+  replace_env_value "$staged" SEJATI_ADMIN_SYNC_KEY "$CENTRAL_KEY_VALUE"
+  compose_with "$staged" config --quiet
+  expected_companies="$(probe_central "$staged")" || {
+    rm "$staged"
+    fail "Central rejected the new sync key or returned no company grant. The production configuration was not changed."
+  }
+  existing_companies="$(local_grant_company_ids "$ENV_FILE" || true)"
+  if [[ -z "$existing_companies" || "$existing_companies" != "$expected_companies" ]]; then
+    rm "$staged"
+    fail "The new central key belongs to a different company set. The production configuration was not changed."
+  fi
+  compose_with "$staged" up -d --wait api
+  if ! verify_services "$staged" || ! verify_grant_set "$staged" "$expected_companies"; then
+    rm "$staged"
+    if rollback_application "$ENV_FILE"; then
+      fail "The new central configuration failed. The previous configuration was restored and passed local health checks."
+    fi
+    fail "The new central configuration failed, and the previous configuration could not be restored to a healthy state. The production .env was not changed."
+  fi
+  install -m 0600 "$staged" "$ENV_FILE"
+  rm "$staged"
+  unset CENTRAL_KEY_VALUE
+  record_operation configure-central "$(state_value current-release)" succeeded
+  info "Central configuration was updated."
+}
+
+self_update() {
+  require_root
+  local release="${1:-}" temporary expected actual
+  validate_cli_release "$release"
+  require_command curl
+  require_command sha256sum
+  temporary="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fsSL "$(release_url "$release" install.sh)" -o "$temporary/install.sh"
+  curl --proto '=https' --tlsv1.2 -fsSL "$(release_url "$release" install.sh.sha256)" -o "$temporary/install.sh.sha256"
+  expected="$(awk 'NR == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$temporary/install.sh.sha256")"
+  actual="$(sha256sum "$temporary/install.sh" | awk '{print $1}')"
+  [[ -n "$expected" && "$actual" == "$expected" ]] || {
+    rm -r "$temporary"
+    fail "The CLI installer checksum did not match."
+  }
+  bash "$temporary/install.sh"
+  rm -r "$temporary"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+  case "$command" in
+    install) [[ "$#" -eq 1 ]] || fail "Usage: pluto install <app-vX.Y.Z>"; install_release "$1" ;;
+    update) [[ "$#" -eq 1 ]] || fail "Usage: pluto update <app-vX.Y.Z>"; update_release "$1" ;;
+    status) [[ "$#" -eq 0 ]] || fail "Usage: pluto status"; status_command ;;
+    doctor) [[ "$#" -eq 0 ]] || fail "Usage: pluto doctor"; doctor_command ;;
+    backup) [[ "$#" -le 1 ]] || fail "Usage: pluto backup [destination]"; require_root; require_layout; lock_mutation; backup_command "${1:-$BACKUPS_DIR}" ;;
+    configure) [[ "${1:-}" == "central" && "$#" -eq 1 ]] || fail "Usage: pluto configure central"; configure_central ;;
+    registry-check) [[ "$#" -eq 0 ]] || fail "Usage: pluto registry-check"; registry_check ;;
+    self-update) [[ "$#" -eq 1 ]] || fail "Usage: pluto self-update <vX.Y.Z>"; self_update "$1" ;;
+    version|--version|-V) info "pluto $PLUTO_CLI_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; fail "Unknown command: $command" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
