@@ -10,7 +10,7 @@ export PLUTO_ROOT="$temporary/pluto"
 mkdir -p "$PLUTO_ROOT/state" "$PLUTO_ROOT/releases"
 source ./pluto
 
-[[ "$(pluto_output="$(main version)"; printf '%s' "$pluto_output")" == "pluto 1.0.0" ]]
+[[ "$(pluto_output="$(main version)"; printf '%s' "$pluto_output")" == "pluto $PLUTO_CLI_VERSION" ]]
 version_is_older 1.0.0 1.0.1
 if version_is_older 1.0.1 1.0.0; then
   exit 1
