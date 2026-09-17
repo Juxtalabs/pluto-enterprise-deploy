@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-PLUTO_CLI_VERSION="1.0.1"
+PLUTO_CLI_VERSION="1.0.2"
 PLUTO_ROOT="${PLUTO_ROOT:-/opt/pluto}"
 PLUTO_REPOSITORY="Juxtalabs/pluto-enterprise-deploy"
 COMPOSE_FILE="$PLUTO_ROOT/compose.yaml"
@@ -286,11 +286,14 @@ preflight_new_install() {
   else
     WEB_BIND_PORT=18080
   fi
-  while IFS= read -r identifier; do
-    while IFS= read -r subnet; do
-      [[ "$subnet" == "10.88.0.0/24" ]] && fail "Docker subnet 10.88.0.0/24 is already in use."
-    done < <(docker network inspect --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' "$identifier")
-  done < <(docker network ls --quiet)
+  # shellcheck disable=SC2046
+  for identifier in $(docker network ls --quiet); do
+    for subnet in $(docker network inspect --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' "$identifier"); do
+      if [[ "$subnet" == "10.88.0.0/24" ]]; then
+        fail "Docker subnet 10.88.0.0/24 is already in use."
+      fi
+    done
+  done
 }
 
 verify_database_revision() {

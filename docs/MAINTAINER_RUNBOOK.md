@@ -131,9 +131,9 @@ Use the exact CLI version supplied by Pluto. The example below installs `v1.0.1`
 
 ```bash
 curl -fLO \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh
 curl -fLO \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh.sha256
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh.sha256
 sha256sum --check install.sh.sha256
 sudo sh install.sh
 pluto version
@@ -142,7 +142,7 @@ pluto version
 Expected final lines:
 
 ```text
-Pluto deployment CLI v1.0.1 is installed.
+Pluto deployment CLI v1.0.2 is installed.
 Next: sudo pluto install app-vX.Y.Z
 pluto 1.0.1
 ```

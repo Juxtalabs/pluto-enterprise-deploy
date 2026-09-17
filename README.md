@@ -15,9 +15,9 @@ pinned installer release, verify it, and install the CLI:
 
 ```bash
 curl -fL -o install.sh \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh
 curl -fL -o install.sh.sha256 \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh.sha256
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh.sha256
 sha256sum --check install.sh.sha256
 sudo sh install.sh
 ```
