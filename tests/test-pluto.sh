@@ -98,6 +98,14 @@ EOF
   [[ "$(probe_central "$temporary/central.env")" == "$expected_companies" ]]
 )
 
+(
+  ss() {
+    printf '%s\n' 'LISTEN 0 511 127.0.0.1:18080' 'LISTEN 0 511 127.0.0.1:18888'
+  }
+  printf 'not-a-port\n80\n18888\n18444\n' | pick_web_bind_port
+)
+[[ "$WEB_BIND_PORT" == "18444" ]]
+
 printf '{"grants":[]}\n' >"$temporary/empty-central-response.json"
 if central_company_ids_from_response <"$temporary/empty-central-response.json"; then
   printf 'An empty central grant response was accepted.\n' >&2

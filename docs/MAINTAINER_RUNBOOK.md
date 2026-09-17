@@ -56,7 +56,9 @@ release URLs means the release is not available; do not substitute an unapproved
 
 ## VPS requirements
 
-Use a dedicated, current x86-64 Ubuntu LTS VPS for the first supported topology:
+Use a current x86-64 Ubuntu LTS VPS. A dedicated VPS is the recommended topology; a shared
+host also works as long as the default local port 18080 is free, or an alternative port is
+chosen at the installer prompt.
 
 | Resource | Minimum |
 |---|---:|
@@ -125,13 +127,13 @@ Docker stores the login for the root account, normally in `/root/.docker/config.
 
 ## Install the deployment CLI once
 
-Use the exact CLI version supplied by Pluto. The example below installs `v1.0.0`:
+Use the exact CLI version supplied by Pluto. The example below installs `v1.0.1`:
 
 ```bash
-curl -fL -o install.sh \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.0/install.sh
-curl -fL -o install.sh.sha256 \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.0/install.sh.sha256
+curl -fLO \
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh
+curl -fLO \
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.1/install.sh.sha256
 sha256sum --check install.sh.sha256
 sudo sh install.sh
 pluto version
@@ -140,9 +142,9 @@ pluto version
 Expected final lines:
 
 ```text
-Pluto deployment CLI v1.0.0 is installed.
+Pluto deployment CLI v1.0.1 is installed.
 Next: sudo pluto install app-vX.Y.Z
-pluto 1.0.0
+pluto 1.0.1
 ```
 
 The bootstrap installs:
@@ -169,6 +171,10 @@ The command asks for:
 2. The standalone sync key. Input is hidden; paste only the key value Pluto supplied.
 3. The GHCR username supplied by Pluto.
 4. The GHCR token. Input is hidden.
+
+If TCP port 18080 is already in use on the VPS, the installer asks for an alternative local
+port instead of failing. Enter any free port (for example 18081) and use that same port in
+your reverse proxy route (section "DNS and HTTPS").
 
 The central endpoint and the minimum browser version are fixed by the installer. It rejects a malformed sync key and image manifests outside Pluto's two allowlisted package names.
 
@@ -197,10 +203,10 @@ reverse-proxy configuration, then require `sudo pluto doctor` to pass before han
 
 ## DNS and HTTPS
 
-Create the DNS record for the exact origin supplied to the installer. Terminate TLS at the company's reverse proxy or approved tunnel, and send requests to:
+Create the DNS record for the exact origin supplied to the installer. Terminate TLS at the company's reverse proxy or approved tunnel, and send requests to the local bind shown by `sudo pluto status`:
 
 ```text
-http://127.0.0.1:18080
+http://127.0.0.1:18080    # default; the installer prints it if it differs
 ```
 
 Minimal nginx upstream shape:

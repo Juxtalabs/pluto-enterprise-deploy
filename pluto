@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-PLUTO_CLI_VERSION="1.0.0"
+PLUTO_CLI_VERSION="1.0.1"
 PLUTO_ROOT="${PLUTO_ROOT:-/opt/pluto}"
 PLUTO_REPOSITORY="Juxtalabs/pluto-enterprise-deploy"
 COMPOSE_FILE="$PLUTO_ROOT/compose.yaml"
@@ -231,7 +231,7 @@ PLUTO_API_IMAGE=$api_image
 PLUTO_WEB_IMAGE=$web_image
 PLUTO_PUBLIC_ORIGIN=$origin
 PLUTO_NETWORK_SUBNET=10.88.0.0/24
-PLUTO_WEB_BIND=127.0.0.1:18080
+PLUTO_WEB_BIND=127.0.0.1:$WEB_BIND_PORT
 POSTGRES_PASSWORD=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
 PASSWORD_ENC_KEY=$(openssl rand -hex 32)
@@ -258,6 +258,22 @@ EOF
   unset CENTRAL_KEY_VALUE
 }
 
+pick_web_bind_port() {
+  local port
+  while true; do
+    read -r -p "TCP port 18080 is already in use. Enter an alternative port for the local dashboard (loopback only): " port || fail "No port entered."
+    [[ "$port" =~ ^[0-9]+$ ]] || { info "Enter a number between 1024 and 65535."; continue; }
+    (( port >= 1024 && port <= 65535 )) || { info "Port must be between 1024 and 65535."; continue; }
+    [[ "$port" == "18080" ]] && { info "TCP port 18080 is already in use on this host."; continue; }
+    if command -v ss >/dev/null 2>&1 && ss -ltnH | awk '{print $4}' | grep -Eq "(^|:|\])${port}\$"; then
+      info "TCP port $port is also in use. Try another."
+      continue
+    fi
+    break
+  done
+  WEB_BIND_PORT="$port"
+}
+
 preflight_new_install() {
   local identifier subnet
   docker compose ls --format json | jq -e '.[] | select(.Name == "pluto")' >/dev/null 2>&1 && fail "A Docker Compose project named pluto already exists."
@@ -265,7 +281,10 @@ preflight_new_install() {
   docker volume inspect pluto-redis-data >/dev/null 2>&1 && fail "Docker volume pluto-redis-data already exists. Pluto will not adopt it."
   docker network inspect pluto-net >/dev/null 2>&1 && fail "Docker network pluto-net already exists. Pluto will not adopt it."
   if command -v ss >/dev/null 2>&1 && ss -ltnH | awk '{print $4}' | grep -Eq '(^|:|\])18080$'; then
-    fail "TCP port 18080 is already in use."
+    info "TCP port 18080 is already in use on this host."
+    pick_web_bind_port
+  else
+    WEB_BIND_PORT=18080
   fi
   while IFS= read -r identifier; do
     while IFS= read -r subnet; do
@@ -358,10 +377,11 @@ verify_grant_set() {
 
 verify_services() {
   local env_file="$1"
-  local origin
+  local origin bind
   origin="$(env_value PLUTO_PUBLIC_ORIGIN "$env_file")"
+  bind="$(env_value PLUTO_WEB_BIND "$env_file")"
   compose_with "$env_file" ps
-  curl -fsS --max-time 10 http://127.0.0.1:18080/ping -o /dev/null || return 1
+  curl -fsS --max-time 10 "http://${bind:-127.0.0.1:18080}/ping" -o /dev/null || return 1
   if ! curl -fsS --max-time 15 "$origin/ping" -o /dev/null; then
     info "Warning: $origin/ping is not reachable yet. Finish DNS and HTTPS proxy setup, then run pluto doctor."
   fi
@@ -558,6 +578,7 @@ status_command() {
   info "Release: ${release:-incomplete installation}"
   info "Database revision: ${revision:-unknown}"
   info "Dashboard: $origin"
+  info "Local bind: http://$(env_value PLUTO_WEB_BIND) (reverse proxy target)"
   info "Central: $central"
   info "Environment: $ENV_FILE (root:root 0600)"
   info "Last verified backup: ${backup:-none recorded}"
@@ -582,7 +603,8 @@ doctor_command() {
     failures=$((failures + 1))
   fi
   if [[ -f "$ENV_FILE" ]]; then
-    local mode owner origin central
+    local mode owner origin central bind
+    bind="$(env_value PLUTO_WEB_BIND)"
     mode="$(stat -c '%a' "$ENV_FILE")"
     owner="$(stat -c '%U:%G' "$ENV_FILE")"
     if [[ "$mode" == "600" && "$owner" == "root:root" ]]; then
@@ -597,8 +619,8 @@ doctor_command() {
       info "FAIL Compose configuration"
       failures=$((failures + 1))
     fi
-    if curl -fsS --max-time 10 http://127.0.0.1:18080/ping -o /dev/null; then
-      info "OK  local dashboard /ping"
+    if curl -fsS --max-time 10 "http://${bind:-127.0.0.1:18080}/ping" -o /dev/null; then
+      info "OK  local dashboard /ping (${bind:-127.0.0.1:18080})"
     else
       info "FAIL local dashboard /ping"
       failures=$((failures + 1))
