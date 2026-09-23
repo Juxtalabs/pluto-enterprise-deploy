@@ -9,8 +9,7 @@
     "release",
     "source_commit",
     "api_image",
-    "web_image",
-    "alembic_head",
+    "migration_head",
     "minimum_pluto_cli",
     "created_at"
   ],
@@ -30,11 +29,7 @@
       "type": "string",
       "pattern": "^ghcr\\.io/juxtalabs/pluto-enterprise-api@sha256:[0-9a-f]{64}$"
     },
-    "web_image": {
-      "type": "string",
-      "pattern": "^ghcr\\.io/juxtalabs/pluto-enterprise-web@sha256:[0-9a-f]{64}$"
-    },
-    "alembic_head": {
+    "migration_head": {
       "type": "string",
       "minLength": 1
     },

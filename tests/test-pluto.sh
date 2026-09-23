@@ -42,9 +42,8 @@ cat >"$temporary/valid-manifest.json" <<'EOF'
   "release": "app-v0.9.25",
   "source_commit": "0000000000000000000000000000000000000000",
   "api_image": "ghcr.io/juxtalabs/pluto-enterprise-api@sha256:0000000000000000000000000000000000000000000000000000000000000000",
-  "web_image": "ghcr.io/juxtalabs/pluto-enterprise-web@sha256:1111111111111111111111111111111111111111111111111111111111111111",
-  "alembic_head": "0037",
-  "minimum_pluto_cli": "1.0.0",
+  "migration_head": "0001_baseline",
+  "minimum_pluto_cli": "1.1.0",
   "created_at": "2026-09-17T00:00:00Z"
 }
 EOF
@@ -53,6 +52,13 @@ validate_manifest_file app-v0.9.25 "$temporary/valid-manifest.json"
 sed 's#pluto-enterprise-api#different-api#' "$temporary/valid-manifest.json" >"$temporary/invalid-manifest.json"
 if PLUTO_ROOT="$temporary/reject" bash -c "source '$repository_root/pluto'; validate_manifest_file app-v0.9.25 '$temporary/invalid-manifest.json'"; then
   printf 'Manifest with an unapproved image was accepted.\n' >&2
+  exit 1
+fi
+
+jq '. + {web_image: "ghcr.io/juxtalabs/pluto-enterprise-web@sha256:1111111111111111111111111111111111111111111111111111111111111111", alembic_head: "0038"} | del(.migration_head)' \
+  "$temporary/valid-manifest.json" >"$temporary/python-manifest.json"
+if PLUTO_ROOT="$temporary/reject" bash -c "source '$repository_root/pluto'; validate_manifest_file app-v0.9.25 '$temporary/python-manifest.json'"; then
+  printf 'A two-image Python release manifest was accepted.\n' >&2
   exit 1
 fi
 

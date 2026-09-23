@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-PLUTO_CLI_VERSION="1.0.2"
+PLUTO_CLI_VERSION="1.1.0"
 PLUTO_ROOT="${PLUTO_ROOT:-/opt/pluto}"
 PLUTO_REPOSITORY="Juxtalabs/pluto-enterprise-deploy"
 COMPOSE_FILE="$PLUTO_ROOT/compose.yaml"
@@ -135,11 +135,10 @@ validate_manifest_file() {
       and .release == $release
       and (.source_commit | test("^[0-9a-f]{40}$"))
       and (.api_image | test("^ghcr\\.io/juxtalabs/pluto-enterprise-api@sha256:[0-9a-f]{64}$"))
-      and (.web_image | test("^ghcr\\.io/juxtalabs/pluto-enterprise-web@sha256:[0-9a-f]{64}$"))
-      and (.alembic_head | type == "string" and length > 0)
+      and (.migration_head | type == "string" and length > 0)
       and (.minimum_pluto_cli | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
       and (.created_at | type == "string" and length > 0)
-      and ((keys | sort) == (["alembic_head", "api_image", "created_at", "minimum_pluto_cli", "release", "schema_version", "source_commit", "web_image"] | sort))' \
+      and ((keys | sort) == (["api_image", "created_at", "migration_head", "minimum_pluto_cli", "release", "schema_version", "source_commit"] | sort))' \
     "$manifest" >/dev/null || fail "The release manifest is not valid."
   minimum="$(jq -r '.minimum_pluto_cli' "$manifest")"
   version_is_older "$PLUTO_CLI_VERSION" "$minimum" && fail "Release $release requires Pluto CLI $minimum or newer. Run pluto self-update first."
@@ -196,7 +195,6 @@ stage_release_env() {
   local target="$RELEASES_DIR/$release.env"
   install -m 0600 "$source_file" "$target"
   replace_env_value "$target" PLUTO_API_IMAGE "$(manifest_value "$release" api_image)"
-  replace_env_value "$target" PLUTO_WEB_IMAGE "$(manifest_value "$release" web_image)"
   printf '%s' "$target"
 }
 
@@ -209,7 +207,7 @@ read_central_key() {
 }
 
 prompt_first_install() {
-  local origin username token api_image web_image
+  local origin username token api_image
   read -r -p "Enterprise dashboard origin (https://... with no trailing slash): " origin
   [[ "$origin" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || fail "Enter an HTTPS origin with no path or trailing slash."
   read_central_key
@@ -221,14 +219,12 @@ prompt_first_install() {
   printf '%s' "$token" | docker login ghcr.io --username "$username" --password-stdin >/dev/null || fail "GHCR login failed. Confirm the username, token, and package access with Pluto."
   unset token
   api_image="$(manifest_value "$INSTALL_RELEASE" api_image)"
-  web_image="$(manifest_value "$INSTALL_RELEASE" web_image)"
   umask 077
   local temporary
   temporary="$(mktemp "$PLUTO_ROOT/.env.XXXXXX")"
   cat >"$temporary" <<EOF
 COMPOSE_PROJECT_NAME=pluto
 PLUTO_API_IMAGE=$api_image
-PLUTO_WEB_IMAGE=$web_image
 PLUTO_PUBLIC_ORIGIN=$origin
 PLUTO_NETWORK_SUBNET=10.88.0.0/24
 PLUTO_WEB_BIND=127.0.0.1:$WEB_BIND_PORT
@@ -300,7 +296,7 @@ verify_database_revision() {
   local env_file="$1"
   local expected="$2"
   local actual
-  actual="$(compose_with "$env_file" exec -T postgres psql -U pluto -d pluto -Atc 'SELECT version_num FROM alembic_version' | tr -d '[:space:]')"
+  actual="$(compose_with "$env_file" exec -T postgres psql -U pluto -d pluto -Atc 'SELECT id FROM schema_migrations ORDER BY id DESC LIMIT 1' | tr -d '[:space:]')"
   [[ "$actual" == "$expected" ]] || fail "Database migration revision is $actual; expected $expected."
 }
 
@@ -392,7 +388,7 @@ verify_services() {
 
 rollback_application() {
   local previous_env="$1"
-  compose_with "$previous_env" up -d --wait api web && verify_services "$previous_env"
+  compose_with "$previous_env" up -d --wait api && verify_services "$previous_env"
 }
 
 record_operation() {
@@ -430,19 +426,19 @@ install_release() {
   local staged expected expected_companies existing_companies
   staged="$(stage_release_env "$INSTALL_RELEASE" "$ENV_FILE")"
   expected_companies="$(probe_central "$staged")" || fail "Central rejected the sync key or returned no company grant. Confirm the standalone key with Pluto."
-  compose_with "$staged" pull api web
+  compose_with "$staged" pull api
   compose_with "$staged" up -d --wait postgres redis
   existing_companies="$(local_grant_company_ids "$staged" || true)"
   if [[ -n "$existing_companies" && "$existing_companies" != "$expected_companies" ]]; then
     fail "The restored database belongs to a different central company set. Refusing to start the application."
   fi
-  if ! compose_with "$staged" run --rm --no-deps api alembic upgrade head; then
+  if ! compose_with "$staged" run --rm --no-deps api migrate; then
     record_operation install "$INSTALL_RELEASE" migration-failed
     fail "Database migration failed. The database and generated configuration were left in place for diagnosis."
   fi
-  expected="$(manifest_value "$INSTALL_RELEASE" alembic_head)"
+  expected="$(manifest_value "$INSTALL_RELEASE" migration_head)"
   verify_database_revision "$staged" "$expected"
-  compose_with "$staged" up -d --wait api web
+  compose_with "$staged" up -d --wait api
   if ! verify_services "$staged"; then
     record_operation install "$INSTALL_RELEASE" health-check-failed
     fail "The containers started, but the local dashboard health check failed. Run pluto doctor."
@@ -453,7 +449,7 @@ install_release() {
   fi
   install -m 0600 "$staged" "$ENV_FILE"
   write_state_value current-release "$INSTALL_RELEASE"
-  write_state_value current-alembic "$expected"
+  write_state_value current-migration "$expected"
   record_operation install "$INSTALL_RELEASE" succeeded
   info "Pluto Enterprise $INSTALL_RELEASE is installed."
   status_command
@@ -470,7 +466,7 @@ backup_command() {
   [[ -d "$destination" ]] || fail "Backup destination does not exist: $destination"
   [[ -w "$destination" ]] || fail "Backup destination is not writable: $destination"
   release="$(state_value current-release)"
-  revision="$(state_value current-alembic)"
+  revision="$(state_value current-migration)"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   bundle="$destination/pluto-$release-$stamp"
   [[ ! -e "$bundle" ]] || fail "Backup destination already exists: $bundle"
@@ -484,16 +480,16 @@ backup_command() {
     rm -r "$temporary"
     fail "The compressed database backup failed validation."
   }
-  gzip -cd "$temporary/database.sql.gz" | awk '/CREATE TABLE public.alembic_version/ { found = 1 } END { exit !found }' || {
+  gzip -cd "$temporary/database.sql.gz" | awk '/CREATE TABLE public.schema_migrations/ { found = 1 } END { exit !found }' || {
     rm -r "$temporary"
     fail "The database backup does not contain the expected schema marker."
   }
   install -m 0600 "$ENV_FILE" "$temporary/.env"
   jq -n \
     --arg release "$release" \
-    --arg alembic "$revision" \
+    --arg migration "$revision" \
     --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{release: $release, alembic_head: $alembic, created_at: $created_at}' >"$temporary/metadata.json"
+    '{release: $release, migration_head: $migration, created_at: $created_at}' >"$temporary/metadata.json"
   chmod 0600 "$temporary/metadata.json"
   (cd "$temporary" && sha256sum database.sql.gz .env metadata.json >SHA256SUMS)
   chmod 0600 "$temporary/SHA256SUMS"
@@ -522,17 +518,17 @@ update_release() {
   expected_companies="$(probe_central "$staged")" || fail "Central rejected the configured sync key or returned no company grant. Resolve central access before updating."
   existing_companies="$(local_grant_company_ids "$ENV_FILE" || true)"
   [[ -n "$existing_companies" && "$existing_companies" == "$expected_companies" ]] || fail "The local database company set does not match the companies assigned to the configured central key."
-  compose_with "$staged" pull api web
+  compose_with "$staged" pull api
   backup_command "$BACKUPS_DIR"
   previous_env="$RELEASES_DIR/$current.env"
   install -m 0600 "$ENV_FILE" "$previous_env"
-  if ! compose_with "$staged" run --rm --no-deps api alembic upgrade head; then
+  if ! compose_with "$staged" run --rm --no-deps api migrate; then
     record_operation update "$release" migration-failed "$BACKUP_RESULT"
     fail "Migration failed. The existing application remains selected. Backup: $BACKUP_RESULT"
   fi
-  expected="$(manifest_value "$release" alembic_head)"
+  expected="$(manifest_value "$release" migration_head)"
   verify_database_revision "$staged" "$expected"
-  if ! compose_with "$staged" up -d --wait api web; then
+  if ! compose_with "$staged" up -d --wait api; then
     info "The new containers failed health checks. Restoring the previous application images."
     if rollback_application "$previous_env"; then
       record_operation update "$release" application-rollback-succeeded "$BACKUP_RESULT"
@@ -562,7 +558,7 @@ update_release() {
   install -m 0600 "$staged" "$ENV_FILE"
   write_state_value previous-release "$current"
   write_state_value current-release "$release"
-  write_state_value current-alembic "$expected"
+  write_state_value current-migration "$expected"
   record_operation update "$release" succeeded "$BACKUP_RESULT"
   info "Pluto Enterprise was updated from $current to $release."
   status_command
@@ -575,7 +571,7 @@ status_command() {
   release="$(state_value current-release)"
   central="$(env_value SEJATI_ADMIN_URL)"
   origin="$(env_value PLUTO_PUBLIC_ORIGIN)"
-  revision="$(state_value current-alembic)"
+  revision="$(state_value current-migration)"
   backup="$(state_value last-backup)"
   info "Pluto Enterprise"
   info "Release: ${release:-incomplete installation}"
@@ -654,8 +650,8 @@ registry_check() {
   require_root
   require_runtime
   [[ -f "$ENV_FILE" ]] || fail "Pluto is not configured."
-  if compose_with "$ENV_FILE" pull api web; then
-    info "GHCR access is working for both private Pluto packages."
+  if compose_with "$ENV_FILE" pull api; then
+    info "GHCR access is working for the private Pluto package."
   else
     fail "GHCR access failed. Ask Pluto to confirm package access, renew the read:packages token, run docker login ghcr.io, and retry."
   fi

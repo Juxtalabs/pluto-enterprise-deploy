@@ -61,28 +61,14 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-10.88.0.0/24}
       MIN_CLIENT_VERSION: ${MIN_CLIENT_VERSION:?MIN_CLIENT_VERSION is required}
       API_PROFILE: ${API_PROFILE:?API_PROFILE is required}
+    ports:
+      - ${PLUTO_WEB_BIND:-127.0.0.1:18080}:8000
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "/pluto-server", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 20s
-    networks:
-      - pluto
-
-  web:
-    image: ${PLUTO_WEB_IMAGE:?PLUTO_WEB_IMAGE is required}
-    restart: unless-stopped
-    depends_on:
-      api:
-        condition: service_healthy
-    ports:
-      - ${PLUTO_WEB_BIND:-127.0.0.1:18080}:80
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
+      start_period: 10s
     networks:
       - pluto
 

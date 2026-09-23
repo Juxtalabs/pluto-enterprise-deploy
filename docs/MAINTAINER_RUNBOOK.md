@@ -2,7 +2,7 @@
 
 This runbook is for the company developer or infrastructure maintainer who operates Pluto Enterprise on the company's own VPS. Pluto does not need SSH access to the VPS.
 
-The normal server flow never clones, forks, or downloads the private application source repository. The VPS pulls two private, versioned container images from GitHub Container Registry (GHCR) and uses the public `Juxtalabs/pluto-enterprise-deploy` installer.
+The normal server flow never clones, forks, or downloads the private application source repository. The VPS pulls one private, versioned container image from GitHub Container Registry (GHCR) and uses the public `Juxtalabs/pluto-enterprise-deploy` installer.
 
 ## Responsibilities
 
@@ -12,7 +12,7 @@ Pluto's side:
 - Gives the maintainer the standalone sync key and the pull credential through a secure channel.
 - Publishes approved server releases as private API and dashboard images.
 - Maintains one shared read-only registry credential (a classic GitHub token with only `read:packages`) and supplies its username and token to each maintainer.
-- Supplies the approved deployment CLI version and application release, such as `v1.0.0` and `app-v0.9.25`.
+- Supplies the approved deployment CLI version and application release, such as `v1.1.0` and `app-v1.1.0`.
 - Builds the company-specific browser with the company's Pluto Enterprise HTTPS origin compiled into it.
 - Publishes browser updates in that company's separate public browser-release repository.
 
@@ -30,7 +30,6 @@ The Enterprise company's side:
 |---|---|
 | `Juxtalabs/pluto-enterprise-deploy` | Public installer and deployment tooling; no application source or credentials |
 | `ghcr.io/juxtalabs/pluto-enterprise-api` | Private image; approved package readers only |
-| `ghcr.io/juxtalabs/pluto-enterprise-web` | Private image; approved package readers only |
 | Private application repository | Pluto only; not cloned to the Enterprise VPS |
 | Company browser-release repository | Public release artifacts for that company's browser updater |
 
@@ -40,8 +39,8 @@ Private images prevent normal source-repository access. They cannot make runtime
 
 Do not start until Pluto has supplied all of these:
 
-- Approved deployment CLI release, for example `v1.0.0`.
-- Approved application release, for example `app-v0.9.25`.
+- Approved deployment CLI release, for example `v1.1.0`.
+- Approved application release, for example `app-v1.1.0`.
 - Exact public dashboard origin, for example `https://exam.company.example`.
 - The standalone sync key: a single long string generated in the central dashboard for this
   installation. Keep it secret.
@@ -101,18 +100,17 @@ prerequisite before continuing.
 
 ## The Pluto pull credential
 
-The VPS pulls the two private image packages with one read-only credential that Pluto creates and maintains. The company does not need a GitHub account.
+The VPS pulls the private image package with one read-only credential that Pluto creates and maintains. The company does not need a GitHub account.
 
 Pluto supplies two values through a secure channel:
 
 - The GitHub username that owns the credential.
 - The classic GitHub token with only the `read:packages` scope.
 
-The token can pull the two private image packages:
+The token can pull the private image package:
 
 ```text
 ghcr.io/juxtalabs/pluto-enterprise-api
-ghcr.io/juxtalabs/pluto-enterprise-web
 ```
 
 It grants no repository access. It can never clone, read, or list any source repository, including the private application repository. Do not request or expect wider scopes such as `repo`, `write:packages`, or `delete:packages`.
@@ -127,13 +125,13 @@ Docker stores the login for the root account, normally in `/root/.docker/config.
 
 ## Install the deployment CLI once
 
-Use the exact CLI version supplied by Pluto. The example below installs `v1.0.1`:
+Use the exact CLI version supplied by Pluto. The example below installs `v1.1.0`:
 
 ```bash
 curl -fLO \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.1.0/install.sh
 curl -fLO \
-  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.0.2/install.sh.sha256
+  https://github.com/Juxtalabs/pluto-enterprise-deploy/releases/download/v1.1.0/install.sh.sha256
 sha256sum --check install.sh.sha256
 sudo sh install.sh
 pluto version
@@ -142,9 +140,9 @@ pluto version
 Expected final lines:
 
 ```text
-Pluto deployment CLI v1.0.2 is installed.
+Pluto deployment CLI v1.1.0 is installed.
 Next: sudo pluto install app-vX.Y.Z
-pluto 1.0.1
+pluto 1.1.0
 ```
 
 The bootstrap installs:
@@ -162,7 +160,7 @@ It does not configure or start the application. This bootstrap is normally run o
 Run the exact application release supplied by Pluto:
 
 ```bash
-sudo pluto install app-v0.9.25
+sudo pluto install app-v1.1.0
 ```
 
 The command asks for:
@@ -176,7 +174,7 @@ If TCP port 18080 is already in use on the VPS, the installer asks for an altern
 port instead of failing. Enter any free port (for example 18081) and use that same port in
 your reverse proxy route (section "DNS and HTTPS").
 
-The central endpoint and the minimum browser version are fixed by the installer. It rejects a malformed sync key and image manifests outside Pluto's two allowlisted package names.
+The central endpoint and the minimum browser version are fixed by the installer. It rejects a malformed sync key and image manifests outside Pluto's allowlisted package name.
 
 It then:
 
@@ -186,12 +184,12 @@ It then:
 4. Generates independent database, JWT, password-encryption, and face-binding secrets locally.
 5. Writes `/opt/pluto/.env` as `root:root` with mode `0600`.
 6. Uses the staged sync key to make an authenticated central grant request without exposing the key in process arguments or a response file.
-7. Pulls the private API and dashboard images by immutable digest.
+7. Pulls the private application image by immutable digest.
 8. Starts PostgreSQL 17 and Redis 7.
 9. Refuses a restored database whose company IDs differ from the companies assigned to the key.
-10. Runs `alembic upgrade head` from the new API image before starting the application.
+10. Runs the new image's database migration (`pluto-server migrate`) before starting the application.
 11. Confirms the expected database revision.
-12. Starts and health-checks the API and dashboard.
+12. Starts and health-checks the application, which serves both the API and the dashboard.
 13. Requires the locally verified active company-grant set to match the companies assigned to that key.
 14. Records the installed release only after acceptance succeeds.
 
@@ -330,7 +328,7 @@ It fails if `pg_dump` fails, tests the compressed dump, checks for the expected 
 Verify a copied bundle:
 
 ```bash
-sudo sh -c 'cd /secure/off-host/pluto/pluto-app-v0.9.25-YYYYMMDDTHHMMSSZ && sha256sum --check SHA256SUMS'
+sudo sh -c 'cd /secure/off-host/pluto/pluto-app-v1.1.0-YYYYMMDDTHHMMSSZ && sha256sum --check SHA256SUMS'
 ```
 
 The bundle contains production credentials. Encrypt the destination, limit access, include it in the company's retention policy, and test restoration before handoff and at the agreed interval.
@@ -379,7 +377,7 @@ sudo gzip -cd /path/to/backup/database.sql.gz | sudo docker compose \
 8. Resume installation using the release named in `metadata.json`:
 
 ```bash
-sudo pluto install app-v0.9.25
+sudo pluto install app-v1.1.0
 ```
 
 Because `.env` already exists and no completed installation is recorded, `pluto install` uses the
@@ -388,14 +386,14 @@ application, and confirms the local active grant set.
 
 9. Verify admin login, one browser login, reports, and encrypted credential reveal. Record the restore-test date and operator, but no secrets.
 
-A live production restore is a destructive incident procedure. Stop and coordinate it with Pluto and the company's database owner; the CLI does not automatically overwrite a live database or run Alembic downgrade.
+A live production restore is a destructive incident procedure. Stop and coordinate it with Pluto and the company's database owner; the CLI does not automatically overwrite a live database or reverse a database migration.
 
 ## Update the Enterprise server
 
 Pluto sends a new approved application release. During the agreed maintenance window, run one command:
 
 ```bash
-sudo pluto update app-v0.9.26
+sudo pluto update app-v1.1.1
 ```
 
 The updater:
@@ -404,11 +402,11 @@ The updater:
 2. Downloads and validates the new public manifest.
 3. Authenticates the configured key directly with central and requires the local company-grant IDs
    to match the companies assigned to that key.
-4. Pulls both private application images by digest while the current application remains selected.
+4. Pulls the private application image by digest while the current application remains selected.
 5. Creates and verifies a database plus `.env` backup.
-6. Runs the new image's Alembic migration out of band.
+6. Runs the new image's database migration out of band.
 7. Confirms the exact migration revision declared by the release.
-8. Starts the new API and dashboard and waits for health checks.
+8. Starts the new application and waits for its health check.
 9. Requires local `/ping` and the matching locally verified active company-grant set. It warns if
    public `/ping` is unavailable; `pluto doctor` must pass after DNS and TLS are ready.
 10. Records the previous and current release only after success.
@@ -434,7 +432,7 @@ Ask Pluto for a replacement token. Then log in interactively as root:
 sudo docker login ghcr.io --username <username-pluto-supplied>
 ```
 
-Paste the replacement token as the password, and verify both packages:
+Paste the replacement token as the password, and verify the package:
 
 ```bash
 sudo pluto registry-check
@@ -507,7 +505,7 @@ Stop and identify the owner. Pluto does not adopt, rename, stop, or remove unrel
 
 ### Migration failure during update
 
-Do not run `alembic downgrade`, delete the database volume, or rerun random Compose commands. Keep the backup path printed by `pluto update`, collect `sudo pluto status` and relevant service logs, and contact Pluto.
+Do not try to reverse a migration, delete the database volume, or rerun random Compose commands. Keep the backup path printed by `pluto update`, collect `sudo pluto status` and relevant service logs, and contact Pluto.
 
 ## Handoff record
 
@@ -518,7 +516,7 @@ Keep one access-controlled record with:
 - Public origin, DNS/TLS owner, reverse-proxy route, VPS owner, and named maintainer.
 - Pluto pull-credential username and its expiry date, but not the token.
 - Confirmation that the pull credential is limited to `read:packages` with no repository access.
-- Deployment CLI version, application release, API/web image digests, and Alembic revision.
+- Deployment CLI version, application release, application image digest, and database migration revision.
 - Compose project, host binding, network, subnet, and volume names.
 - Statement that secrets live at `/opt/pluto/.env`, owned by root with mode `0600`.
 - Backup destination, encryption/retention owner, last successful backup, and last tested restore.
@@ -536,7 +534,7 @@ Never record the company-admin password, standalone sync key, GHCR token, databa
 - Never copy `/opt/pluto/.env` without encrypting and access-controlling the destination.
 - Never separate the database backup from its matching `.env`.
 - Never run Docker prune as part of installation, update, or recovery.
-- Never run an automatic Alembic downgrade.
+- Never reverse a database migration automatically.
 - Never expose PostgreSQL, Redis, or the API container directly to the internet.
 - Never reuse or move an application release tag.
 - Never publish a screenshot containing a live sync key.

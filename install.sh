@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-PLUTO_CLI_VERSION="1.0.2"
+PLUTO_CLI_VERSION="1.1.0"
 PLUTO_REPOSITORY="Juxtalabs/pluto-enterprise-deploy"
 PLUTO_ROOT="${PLUTO_ROOT:-/opt/pluto}"
 PLUTO_BIN="${PLUTO_BIN:-/usr/local/bin/pluto}"
